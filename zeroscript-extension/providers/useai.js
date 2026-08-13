@@ -9,8 +9,13 @@
 //    and assistant turns are `[data-testid="message-assistant"]`. The readable
 //    turn body lives in a descendant `[data-testid="message-content"]`.
 //  - The composer is a REAL <textarea> (`[data-testid="chat-input-textarea"]`),
-//    not a contenteditable. Setting it via the native textarea value setter + an
-//    input event updates the site's state and enables the send button.
+//    not a contenteditable. The site renders TWO composer instances (a hidden
+//    mobile one + the visible desktop one), so composer selectors all match
+//    twice - every composer lookup filters to visible nodes and the send button
+//    is paired to the editor through their shared container.
+//  - Text goes in via execCommand("insertText") (drives the site's real input
+//    pipeline, which is what enables the send button); a native-setter +
+//    synthetic input event is the fallback.
 //  - The primary send control is a real <button data-testid="send-button">`.
 //    While the reply is streaming, it is replaced by a real
 //    `<button data-testid="stop-button" aria-label="Stop">`, and the UI also
@@ -97,9 +102,34 @@ const ZSProvider = (() => {
   const assistantCount = () => assistantItems().length;
   const userCount = () => document.querySelectorAll(S.userItem).length;
 
+  // use.ai renders TWO composer instances (a hidden mobile one + the visible
+  // desktop one), so every composer selector matches twice. Filter to VISIBLE
+  // nodes and pair the editor with the send button through their shared
+  // container - picking the last textarea but the first button on the page
+  // mismatched the pair, and the send button never enabled ("use.ai send
+  // button did not enable", seen live).
+  const visible = (el) => !!el && el.offsetParent !== null;
+
   const getEditor = () => {
-    const site = [...document.querySelectorAll(S.editor)].filter((e) => !e.closest('#zs-root'));
-    return site[site.length - 1] || null;
+    const site = [...document.querySelectorAll(S.editor)].filter(
+      (e) => !e.closest('#zs-root')
+    );
+    const vis = site.filter(visible);
+    const pool = vis.length ? vis : site;
+    return pool[pool.length - 1] || null;
+  };
+
+  // The nearest ancestor holding BOTH the editor and a send/stop control -
+  // that pairing is what makes the two composer copies distinguishable.
+  const composerRoot = () => {
+    const ed = getEditor();
+    if (!ed) return document;
+    let n = ed.parentElement;
+    while (n && n !== document.body) {
+      if (n.querySelector(S.sendBtn) || n.querySelector(S.stopBtn)) return n;
+      n = n.parentElement;
+    }
+    return document;
   };
 
   const editorText = () => {
@@ -170,13 +200,17 @@ const ZSProvider = (() => {
   }
 
   const sendControl = () => {
-    const root = composerFrame();
-    return (root && root.querySelector(S.sendBtn)) || document.querySelector(S.sendBtn);
+    const root = composerRoot();
+    const btns = [...root.querySelectorAll(S.sendBtn)].filter(visible);
+    if (btns.length) return btns[0];
+    return [...document.querySelectorAll(S.sendBtn)].filter(visible)[0] || null;
   };
 
   const stopButton = () => {
-    const root = composerFrame();
-    return (root && root.querySelector(S.stopBtn)) || document.querySelector(S.stopBtn);
+    const root = composerRoot();
+    const btns = [...root.querySelectorAll(S.stopBtn)].filter(visible);
+    if (btns.length) return btns[0];
+    return [...document.querySelectorAll(S.stopBtn)].filter(visible)[0] || null;
   };
 
   function streamText(item) {
@@ -185,6 +219,22 @@ const ZSProvider = (() => {
   }
 
   const streamLen = (item) => streamText(item === undefined ? lastAssistant() : item).length;
+
+  function sampleStream() {
+    const item = lastAssistant();
+    const len = streamText(item).length;
+    return { item, len };
+  }
+
+  function grewWithin(ms) {
+    const a = sampleStream();
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      const b = sampleStream();
+      if ((b.len || 0) > (a.len || 0)) return true;
+    }
+    return false;
+  }
 
   function isGenerating() {
     if (document.querySelector(S.generating)) return true;
@@ -250,10 +300,18 @@ const ZSProvider = (() => {
     const relock = _locked;
     try {
       if (relock) ed.removeAttribute('readonly');
-      setTextareaValue(ed, text);
-      ed.dispatchEvent(new Event('input', { bubbles: true }));
-      ed.dispatchEvent(new Event('change', { bubbles: true }));
       ed.focus();
+      // Prefer execCommand insertion: it walks the site's real input pipeline
+      // (beforeinput/input), which is what enables the send button. A bare
+      // value-set + synthetic input event can be ignored by the framework.
+      ed.select();
+      let ok = false;
+      try { ok = document.execCommand('insertText', false, text); } catch {}
+      if (!ok || (ed.value || '') !== text) {
+        setTextareaValue(ed, text);
+        ed.dispatchEvent(new Event('input', { bubbles: true }));
+        ed.dispatchEvent(new Event('change', { bubbles: true }));
+      }
       for (let i = 0; i < 40; i++) {
         const btn = sendControl();
         if (btn && !btn.disabled) {
